@@ -4,6 +4,8 @@
 
 It turns a vague task into a clarified execution contract, routes the task through relevant installed skills, then runs a worker, reviewer, and evaluator loop until the goal is complete, blocked, or the iteration limit is reached.
 
+This is an open-source project and contributions are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md) before opening an issue or pull request.
+
 ## What It Does
 
 - Grills unclear tasks before execution.
@@ -202,6 +204,8 @@ Common statuses:
 - `max-iterations-reached`
 
 ## Development
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution workflow, pull request expectations, and local verification.
 
 Before claiming changes are done:
 
