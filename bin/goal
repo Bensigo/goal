@@ -86,6 +86,34 @@ skill_inventory() {
     done
 }
 
+skill_source_is_verifiable() {
+  local skill_path="$1"
+  case "$skill_path" in
+    "$CODEX_HOME/plugins/cache"/*|"$CODEX_HOME/vendor_imports"/*|"$AGENTS_HOME/skills"/*|"$CODEX_HOME/skills"/*)
+      return 0
+      ;;
+    *)
+      if [[ -n "${GOAL_SKILL_SCAN_DIRS:-${CODEX_GOAL_SKILL_SCAN_DIRS:-}}" ]]; then
+        return 0
+      fi
+      return 1
+      ;;
+  esac
+}
+
+skill_file_matches_capability() {
+  local skill_path="$1"
+  local description_regex="$2"
+
+  skill_source_is_verifiable "$skill_path" || return 1
+
+  if [[ -z "$description_regex" ]]; then
+    return 0
+  fi
+
+  rg -i -q "^(description:|[[:space:]]{2,}|#|Use when|Use for|Guides|Expert guidance|Manage|Create|Score).*(${description_regex})" "$skill_path"
+}
+
 skill_exists() {
   local needle="$1"
   rg -i -q "^${needle//\//\\/}\\|" "$STATE_DIR/skill-inventory.txt"
@@ -93,9 +121,273 @@ skill_exists() {
 
 append_skill_if_installed() {
   local skill="$1"
+  local description_regex="${2:-}"
+  local line skill_path
   if skill_exists "$skill"; then
-    rg -i "^${skill//\//\\/}\\|" "$STATE_DIR/skill-inventory.txt" | head -1
+    while IFS= read -r line; do
+      skill_path="${line#*|}"
+      if skill_file_matches_capability "$skill_path" "$description_regex"; then
+        printf "%s\n" "$line"
+        return 0
+      fi
+    done < <(rg -i "^${skill//\//\\/}\\|" "$STATE_DIR/skill-inventory.txt")
   fi
+}
+
+append_candidate_if_installed() {
+  local candidate="$1"
+  local description_regex="${2:-}"
+  local alias
+  IFS=',' read -r -a aliases <<< "$candidate"
+
+  for alias in "${aliases[@]}"; do
+    alias="${alias#"${alias%%[![:space:]]*}"}"
+    alias="${alias%"${alias##*[![:space:]]}"}"
+    if [[ -z "$alias" ]]; then
+      continue
+    fi
+    append_skill_if_installed "$alias" "$description_regex" && return 0
+  done
+
+  return 1
+}
+
+skill_search_recommendation() {
+  local candidate_name="$1"
+  case "$candidate_name" in
+    research-documentation-skill)
+      printf -- "- %s: search/install a verifiable research or documentation skill whose description covers source-backed research, synthesis, or docs.\n" "$candidate_name"
+      ;;
+    client-lead-scoring-skill)
+      printf -- "- %s: search/install a verifiable lead-scoring or job-scoring skill whose description covers ranking prospects, leads, or client fit.\n" "$candidate_name"
+      ;;
+    proposal-outreach-skill)
+      printf -- "- %s: search/install a verifiable proposal or outreach skill whose description covers client outreach, proposals, or sales messaging.\n" "$candidate_name"
+      ;;
+    headline-copywriting-skill)
+      printf -- "- %s: search/install a verifiable headline or copywriting skill whose description covers headlines, offer copy, or conversion writing.\n" "$candidate_name"
+      ;;
+    prompt-engineering-skill)
+      printf -- "- %s: search/install a verifiable prompt-engineering skill whose description covers prompt patterns, evaluation, or LLM reliability.\n" "$candidate_name"
+      ;;
+    *)
+      printf -- "- %s: search/install a verifiable skill whose description clearly covers this capability.\n" "$candidate_name"
+      ;;
+  esac
+}
+
+run_skill_search_command() {
+  local candidate_name="$1"
+  local search_command="${GOAL_SKILL_SEARCH_COMMAND:-${CODEX_GOAL_SKILL_SEARCH_COMMAND:-}}"
+
+  if [[ -z "$search_command" ]]; then
+    return 1
+  fi
+
+  GOAL_SKILL_CAPABILITY="$candidate_name" \
+    GOAL_SKILL_QUERY="$candidate_name" \
+    CODEX_GOAL_SKILL_CAPABILITY="$candidate_name" \
+    CODEX_GOAL_SKILL_QUERY="$candidate_name" \
+    sh -c "$search_command"
+}
+
+urlencode() {
+  python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$1"
+}
+
+json_field() {
+  local field="$1"
+  python3 -c 'import json, sys
+data=json.load(sys.stdin)
+field=sys.argv[1]
+value=data
+for part in field.split("."):
+    value=value.get(part) if isinstance(value, dict) else None
+print("" if value is None else value)' "$field"
+}
+
+skill_detail_matches_capability() {
+  local skill_json="$1"
+  local description_regex="$2"
+  [[ -z "$description_regex" ]] && return 0
+
+  printf "%s" "$skill_json" | python3 -c 'import json, re, sys
+pattern = re.compile(sys.argv[1], re.I)
+data = json.load(sys.stdin)
+for item in data.get("files") or []:
+    if item.get("path") == "SKILL.md" and pattern.search(item.get("contents") or ""):
+        sys.exit(0)
+sys.exit(1)' "$description_regex"
+}
+
+skills_sh_search() {
+  local candidate_name="$1"
+  local description_regex="$2"
+  local query="${3:-$candidate_name}"
+  local api_key="${SKILLS_API_KEY:-${SKILLS_SH_API_KEY:-}}"
+  local base_url="${SKILLS_API_BASE_URL:-https://skills.sh}"
+  local curl_bin="${CURL_BIN:-curl}"
+  local encoded search_json candidates candidate_json id name source source_type install_url url is_duplicate detail_json audit_json audit_status
+
+  if [[ -z "$api_key" ]] || ! command -v python3 >/dev/null 2>&1; then
+    return 1
+  fi
+
+  encoded="$(urlencode "$query")"
+  search_json="$("$curl_bin" -fsS "$base_url/api/v1/skills/search?q=$encoded&limit=10" \
+    -H "Authorization: Bearer $api_key" 2>/dev/null || true)"
+  [[ -n "$search_json" ]] || return 1
+
+  candidates="$(printf "%s" "$search_json" | python3 -c 'import json, sys
+data=json.load(sys.stdin)
+for item in data.get("data", []):
+    print(json.dumps(item, separators=(",", ":")))' 2>/dev/null || true)"
+
+  while IFS= read -r candidate_json; do
+    [[ -n "$candidate_json" ]] || continue
+    is_duplicate="$(printf "%s" "$candidate_json" | json_field "isDuplicate")"
+    [[ "$is_duplicate" == "True" || "$is_duplicate" == "true" ]] && continue
+
+    id="$(printf "%s" "$candidate_json" | json_field "id")"
+    name="$(printf "%s" "$candidate_json" | json_field "name")"
+    source="$(printf "%s" "$candidate_json" | json_field "source")"
+    source_type="$(printf "%s" "$candidate_json" | json_field "sourceType")"
+    install_url="$(printf "%s" "$candidate_json" | json_field "installUrl")"
+    url="$(printf "%s" "$candidate_json" | json_field "url")"
+
+    [[ -n "$id" && -n "$install_url" ]] || continue
+    [[ "$source_type" == "github" || "$source_type" == "well-known" ]] || continue
+
+    detail_json="$("$curl_bin" -fsS "$base_url/api/v1/skills/$id" \
+      -H "Authorization: Bearer $api_key" 2>/dev/null || true)"
+    [[ -n "$detail_json" ]] || continue
+    skill_detail_matches_capability "$detail_json" "$description_regex" || continue
+
+    audit_json="$("$curl_bin" -fsS "$base_url/api/v1/skills/audit/$id" \
+      -H "Authorization: Bearer $api_key" 2>/dev/null || true)"
+    audit_status="audit unknown"
+    if [[ -n "$audit_json" ]]; then
+      audit_status="$(printf "%s" "$audit_json" | python3 -c 'import json, sys
+data=json.load(sys.stdin)
+audits=data.get("audits") or []
+bad=[a for a in audits if str(a.get("status", "")).lower()=="fail" or str(a.get("riskLevel", "")).upper() in {"HIGH","CRITICAL"}]
+warn=[a for a in audits if str(a.get("status", "")).lower()=="warn" or str(a.get("riskLevel", "")).upper()=="MEDIUM"]
+print("audit fail" if bad else ("audit warn" if warn else ("audit pass" if audits else "audit unknown")))' 2>/dev/null || printf "audit unknown")"
+      [[ "$audit_status" == "audit fail" ]] && continue
+    fi
+
+    printf "%s (%s) from %s/%s; %s; install with: npx skills add %s" "$name" "$url" "$source_type" "$source" "$audit_status" "$install_url"
+    return 0
+  done <<< "$candidates"
+
+  return 1
+}
+
+open_agent_skill_search() {
+  local candidate_name="$1"
+  local description_regex="$2"
+  local query="${3:-$candidate_name}"
+  local base_url="${OPEN_AGENT_SKILL_BASE_URL:-https://openagentskill.com}"
+  local curl_bin="${CURL_BIN:-curl}"
+  local encoded search_json candidates candidate_json slug name description long_description verified install repository detail_url detail_json rating downloads
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    return 1
+  fi
+
+  encoded="$(urlencode "$query")"
+  search_json="$("$curl_bin" -fsSL "$base_url/api/agent/skills?q=$encoded&format=json" 2>/dev/null || true)"
+  [[ -n "$search_json" ]] || return 1
+
+  candidates="$(printf "%s" "$search_json" | python3 -c 'import json, sys
+data=json.load(sys.stdin)
+for item in data.get("skills", []):
+    print(json.dumps(item, separators=(",", ":")))' 2>/dev/null || true)"
+
+  while IFS= read -r candidate_json; do
+    [[ -n "$candidate_json" ]] || continue
+    verified="$(printf "%s" "$candidate_json" | json_field "verified")"
+    [[ "$verified" == "True" || "$verified" == "true" ]] || continue
+
+    slug="$(printf "%s" "$candidate_json" | json_field "slug")"
+    name="$(printf "%s" "$candidate_json" | json_field "name")"
+    description="$(printf "%s" "$candidate_json" | json_field "description")"
+    install="$(printf "%s" "$candidate_json" | json_field "install")"
+    repository="$(printf "%s" "$candidate_json" | json_field "repository")"
+    detail_url="$(printf "%s" "$candidate_json" | json_field "urls.detail")"
+    rating="$(printf "%s" "$candidate_json" | json_field "stats.rating")"
+    downloads="$(printf "%s" "$candidate_json" | json_field "stats.downloads")"
+
+    [[ -n "$slug" && -n "$install" ]] || continue
+
+    detail_json="$("$curl_bin" -fsSL "$base_url/api/agent/skills/$slug?format=json" 2>/dev/null || true)"
+    if [[ -n "$detail_json" ]]; then
+      long_description="$(printf "%s" "$detail_json" | json_field "long_description")"
+      [[ -n "$detail_url" ]] || detail_url="$(printf "%s" "$detail_json" | json_field "urls.web")"
+      [[ -n "$repository" ]] || repository="$(printf "%s" "$detail_json" | json_field "repository")"
+    else
+      long_description=""
+    fi
+
+    if [[ -n "$description_regex" ]]; then
+      printf "%s\n%s\n" "$description" "$long_description" | rg -i -q "$description_regex" || continue
+    fi
+
+    printf "%s (%s) from Open Agent Skill; verified public listing; rating %s; downloads %s; repo %s; install with: %s" "$name" "$detail_url" "$rating" "$downloads" "$repository" "$install"
+    return 0
+  done <<< "$candidates"
+
+  return 1
+}
+
+build_skill_recommendations() {
+  local missing="$1"
+  local line candidate_name recommendations search_result query description_regex
+  recommendations=""
+
+  while IFS= read -r line; do
+    [[ "$line" == "- "* ]] || continue
+    [[ "$line" == "- none" ]] && continue
+    candidate_name="${line#- }"
+    case "$candidate_name" in
+      research-documentation-skill)
+        query="research documentation sources"; description_regex="research|documentation|sources"
+        ;;
+      client-lead-scoring-skill)
+        query="client lead scoring"; description_regex="lead[[:space:]-]?scoring|score.*job|score.*lead"
+        ;;
+      proposal-outreach-skill)
+        query="client proposal outreach"; description_regex="outreach|client"
+        ;;
+      headline-copywriting-skill)
+        query="headline copywriting"; description_regex="headline|copywriting|copy"
+        ;;
+      prompt-engineering-skill)
+        query="prompt engineering"; description_regex="prompt[[:space:]-]?engineering"
+        ;;
+      *)
+        query="$candidate_name"; description_regex=""
+        ;;
+    esac
+    search_result="$(open_agent_skill_search "$candidate_name" "$description_regex" "$query" 2>/dev/null || true)"
+    if [[ -z "$search_result" ]]; then
+      search_result="$(skills_sh_search "$candidate_name" "$description_regex" "$query" 2>/dev/null || true)"
+    fi
+    if [[ -z "$search_result" ]]; then
+      search_result="$(run_skill_search_command "$candidate_name" 2>/dev/null || true)"
+    fi
+    if [[ -n "$search_result" ]]; then
+      recommendations+="- ${candidate_name}: ${search_result}"$'\n'
+    else
+      recommendations+="$(skill_search_recommendation "$candidate_name")"$'\n'
+    fi
+  done <<< "$missing"
+
+  if [[ -z "$recommendations" ]]; then
+    recommendations="- none"$'\n'
+  fi
+
+  printf "%s" "$recommendations"
 }
 
 append_skill_plan() {
@@ -105,12 +397,15 @@ append_skill_plan() {
 
   skill_inventory | sort -fu > "$STATE_DIR/skill-inventory.txt"
 
-  local goal_lower task_type candidates installed missing skill line skill_path
+  local goal_lower task_type candidates installed missing recommendations candidate candidate_name candidate_aliases candidate_description line skill_path missing_approval
   goal_lower="$(tr '[:upper:]' '[:lower:]' < "$GOAL_FILE")"
   task_type="general"
   candidates=""
 
-  if [[ "$goal_lower" =~ bug|fix|code|coding|refactor|test|implement ]]; then
+  if [[ "$goal_lower" =~ client[[:space:]-]?acquisition|lead[[:space:]-]?gen|lead[[:space:]-]?generation|sales|outreach|prospect|proposal|twitter|x/twitter|x[[:space:]-]?search|x[[:space:]-]?lead ]]; then
+    task_type="client-acquisition"
+    candidates="research-documentation-skill|notion-research-documentation,research-documentation|research|documentation|sources client-lead-scoring-skill|lead-scoring,job-scoring|lead[[:space:]-]?scoring|score.*job|score.*lead proposal-outreach-skill|proposal,outreach,client-proposal|outreach|client headline-copywriting-skill|headline-formulas,copywriting|headline|copywriting|copy prompt-engineering-skill|prompt-engineering-patterns,prompt-engineering|prompt[[:space:]-]?engineering"
+  elif [[ "$goal_lower" =~ bug|fix|code|coding|refactor|test|implement ]]; then
     task_type="coding"
     candidates="test-driven-development verification-before-completion"
     if [[ "$goal_lower" =~ bug|fix|debug|failure|failing|broken|regression ]]; then
@@ -144,13 +439,28 @@ append_skill_plan() {
 
   installed=""
   missing=""
-  for skill in $candidates; do
-    line="$(append_skill_if_installed "$skill" || true)"
+  for candidate in $candidates; do
+    if [[ "$candidate" == *"|"* ]]; then
+      candidate_name="${candidate%%|*}"
+      candidate_aliases="${candidate#*|}"
+      if [[ "$candidate_aliases" == *"|"* ]]; then
+        candidate_description="${candidate_aliases#*|}"
+        candidate_aliases="${candidate_aliases%%|*}"
+      else
+        candidate_description=""
+      fi
+    else
+      candidate_name="$candidate"
+      candidate_aliases="$candidate"
+      candidate_description=""
+    fi
+
+    line="$(append_candidate_if_installed "$candidate_aliases" "$candidate_description" || true)"
     if [[ -n "$line" ]]; then
       skill_path="${line#*|}"
       installed="${installed}- ${line%%|*} (${skill_path})"$'\n'
     else
-      missing="${missing}- ${skill}"$'\n'
+      missing="${missing}- ${candidate_name}"$'\n'
     fi
   done
 
@@ -160,17 +470,28 @@ append_skill_plan() {
   if [[ -z "$missing" ]]; then
     missing="- none"$'\n'
   fi
+  recommendations="$(build_skill_recommendations "$missing")"
+  if [[ "$missing" == "- none"$'\n' ]]; then
+    missing_approval="not required; no missing candidates."
+  elif rg -qi 'Missing Skill Approval:[[:space:]]*approved[[:space:].,;]*$|Skill Discovery Approval:[[:space:]]*approved[[:space:].,;]*$|Approved Missing Skill Skip:[[:space:]]*yes[[:space:].,;]*$' "$GOAL_FILE"; then
+    missing_approval="approved"
+  else
+    missing_approval="required. Goal will stop with needs-skill-approval until the user installs/searches for suitable skills or explicitly approves skipping them."
+  fi
 
   cat >> "$GOAL_FILE" <<EOF
 
 Skill Plan:
 - Task Type: $task_type
+- Skill Discovery Quality Gate: required
 - Required Installed Skills:
 $installed- Missing Skill Candidates:
-$missing- Skill Hub Policy: Do not install skills silently. If no installed skill covers a required task type, stop and ask the user before installing from the skill hub or GitHub.
+$missing- Missing Skill Approval: $missing_approval
+- Skill Search Recommendations:
+$recommendations- Skill Hub Policy: Do not install skills silently. Search the public marketplace, skill hub, GitHub, or local verified sources for missing capabilities, then recommend matching skills for user approval before install/use. Verify candidate skill descriptions and source before treating them as suitable. If the user does not install/approve suitable skills, report that the task cannot be done to a high-quality standard with the current skill set.
 - Worker Skill Requirements: Read and apply every Required Installed Skill before implementation. If a required skill cannot be used, document the blocker in .goal/clarify.md instead of substituting generic work.
 - Reviewer Skill Checks: Fail the review if a required skill was skipped, if the worker used generic work where a specialized skill was available, or if skill-specific verification was omitted.
-- Evaluator Skill Checks: Mark DONE: yes only when the acceptance criteria pass and the Required Installed Skills were followed or a valid blocker was documented.
+- Evaluator Skill Checks: Mark DONE: yes only when the acceptance criteria pass, the Required Installed Skills were followed, and missing specialist skills were either installed or explicitly approved to skip.
 EOF
 }
 
