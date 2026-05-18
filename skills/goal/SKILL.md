@@ -35,7 +35,16 @@ Do not ask vague preference questions such as "what style do you want?" unless t
 - `Out of Scope`: what the worker must not do
 - `Skill Plan`: task type, required installed skills, missing skill candidates, skill hub policy, and worker/reviewer/evaluator skill checks
 
-The CLI appends a `Skill Plan` automatically when it starts. The plan checks installed skills first and does not install missing skills silently.
+Before starting the CLI, run a skill discovery quality gate:
+
+- Identify task types needed for best quality, not just minimum completion.
+- Check installed skills first.
+- Identify likely missing high-value skill candidates from the skill hub or known skill sources when specialist skills could improve the result.
+- Do not install anything silently.
+- If useful missing candidates exist, stop before `start-ready`, explain why they could improve the result, and ask the user whether to approve install/search/use or approve skipping them.
+- Continue only when installed skills cover the high-skill work, missing candidates are installed, or the user explicitly approves skipping them.
+
+The CLI appends a `Skill Plan` automatically when it starts, but the chat handoff must include the quality-gate result so the worker does not assume generic competence where a specialist skill may exist.
 
 3. Start the loop with the ready path so the CLI does not re-grill:
 
@@ -73,9 +82,11 @@ The hybrid flow:
 Skill routing rules:
 
 - Check local installed skills before execution.
-- Require matching installed skills for high-skill task types such as images, articles, slides, research, plans, prototypes, and coding/debugging.
+- Search/identify useful missing skill candidates before execution for high-skill work. This is a quality gate, not an optional optimization.
+- Require matching installed skills for high-skill task types such as images, articles, slides, research, plans, prototypes, marketing/client acquisition, sales/outreach, and coding/debugging.
 - Never install from the skill hub, GitHub, or `npx skills` silently.
-- If a useful skill is missing, write the missing candidates to `.goal/clarify.md`, set status to `needs-skill-approval`, and wait for explicit user approval or manual installation.
+- If a useful specialist skill may improve quality and is not installed, write the missing candidates to `.goal/clarify.md`, set status to `needs-skill-approval`, and wait for explicit user approval, approved skip, or manual installation.
+- Do not treat “I can do this myself” as sufficient for high-skill work when a specialist skill might exist.
 - Worker, reviewer, and evaluator prompts must treat the `Skill Plan` as part of the contract.
 
 The grill session must not create docs just to store questions. It should only update

@@ -10,7 +10,7 @@ This is an open-source project and contributions are welcome. Start with [CONTRI
 
 - Grills unclear tasks before execution.
 - Produces a concrete handoff with Definition of Done, acceptance criteria, verification, scope, and skill routing.
-- Checks installed skills before running the worker.
+- Checks installed skills and missing high-value skill candidates before running the worker.
 - Refuses to install missing skills silently.
 - Runs a worker, reviewer, and evaluator in sequence.
 - Retries stalled workers up to 3 times.
@@ -109,6 +109,8 @@ Skill Plan:
 
 The CLI can append a `Skill Plan` automatically. The worker, reviewer, and evaluator treat it as part of the contract.
 
+For high-skill work, the Skill Plan is a discovery gate, not just routing metadata. If useful specialist skills are missing, `goal` stops with `needs-skill-approval` until you install/search/approve those skills or explicitly approve continuing without them.
+
 `start-ready`, `start-clarified`, and the hook all block autonomous execution unless the handoff includes objective success criteria and a verification plan. At minimum, the goal contract must include `Goal`, `Definition of Done`, `Acceptance Criteria`, `Verification Plan`, and `Out of Scope`.
 
 ## Skill Routing
@@ -129,8 +131,15 @@ It routes common task types to relevant skills:
 - planning -> planning/issue/milestone skills
 - frontend prototypes -> frontend/browser verification skills
 - coding -> TDD and verification skills
+- client acquisition, sales, outreach, or X/Twitter lead research -> research, proposal, scoring, headline, and prompt-engineering skills
 
-If a task clearly needs a skill and no matching installed skill is found, the loop stops with `needs-skill-approval`. It does not install from a skill hub, GitHub, or `npx skills` without explicit user approval.
+If a useful specialist skill candidate is missing, the loop stops with `needs-skill-approval` even when some relevant skills are installed. This prevents the worker from assuming generic competence where a better specialist skill may exist. It does not install from a skill hub, GitHub, or `npx skills` without explicit user approval.
+
+To continue without missing candidates, explicitly add this to the goal contract:
+
+```text
+Missing Skill Approval: approved
+```
 
 ## Runtime Behavior
 

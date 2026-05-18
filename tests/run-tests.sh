@@ -101,6 +101,20 @@ FAKE
   printf "%s\n" "$mode" > "$bin_dir/mode"
 }
 
+make_skill() {
+  local root="$1"
+  local name="$2"
+  mkdir -p "$root/$name"
+  cat > "$root/$name/SKILL.md" <<EOF
+---
+name: $name
+description: Use when tests need the $name skill
+---
+
+# $name
+EOF
+}
+
 test_start_ready_defaults_to_ten_iterations() {
   local project fake_bin
   project="$(make_project)"
@@ -248,20 +262,28 @@ test_hook_rejects_incomplete_goal_contract() {
 }
 
 test_start_ready_appends_installed_skill_plan() {
-  local project fake_bin
+  local project fake_bin skill_dir
   project="$(make_project)"
   fake_bin="$project/fake-bin"
+  skill_dir="$project/skills"
+  mkdir -p "$skill_dir"
+  make_skill "$skill_dir" frontend-app-builder
+  make_skill "$skill_dir" frontend-testing-debugging
+  make_skill "$skill_dir" frontend-skill
+  make_skill "$skill_dir" playwright
+  make_skill "$skill_dir" verification-before-completion
   make_fake_codex "$fake_bin" complete
 
   (
     cd "$project"
-    PATH="$fake_bin:$PATH" GOAL_FAKE_MODE=complete "$BIN" start-ready "Goal: Build a landing page prototype for a web app. Definition of Done: responsive page exists. Acceptance Criteria: browser verification passes. Verification Plan: inspect desktop and mobile. Out of Scope: no deployment."
+    PATH="$fake_bin:$PATH" GOAL_FAKE_MODE=complete GOAL_SKILL_SCAN_DIRS="$skill_dir" "$BIN" start-ready "Goal: Build a landing page prototype for a web app. Definition of Done: responsive page exists. Acceptance Criteria: browser verification passes. Verification Plan: inspect desktop and mobile. Out of Scope: no deployment."
   ) >/dev/null
 
   rg -q '^Skill Plan:' "$project/.goal/goal.md" || fail "goal is missing Skill Plan section"
   rg -q 'Task Type:.*frontend' "$project/.goal/goal.md" || fail "frontend task type was not detected"
   rg -q 'Required Installed Skills:' "$project/.goal/goal.md" || fail "installed skill list missing"
   rg -q 'frontend|playwright|verification' "$project/.goal/goal.md" || fail "expected frontend/browser/verification skill was not routed"
+  rg -q '^- none$' "$project/.goal/goal.md" || fail "fully installed frontend route should not list missing candidates"
 }
 
 test_hook_prompts_enforce_skill_plan() {
@@ -289,6 +311,70 @@ test_missing_task_skill_stops_for_approval() {
   assert_eq "needs-skill-approval" "$(cat "$project/.goal/status")" "missing task skill status"
   rg -q 'imagegen' "$project/.goal/clarify.md" || fail "clarify file does not name missing imagegen skill"
   [[ ! -f "$project/.goal/logs/worker-1.md" ]] || fail "worker ran despite missing required task skill"
+}
+
+test_missing_specialist_skill_blocks_even_with_some_installed() {
+  local project fake_bin skill_dir
+  project="$(make_project)"
+  fake_bin="$project/fake-bin"
+  skill_dir="$project/skills"
+  mkdir -p "$skill_dir"
+  make_skill "$skill_dir" notion-research-documentation
+  make_fake_codex "$fake_bin" complete
+
+  set +e
+  (
+    cd "$project"
+    PATH="$fake_bin:$PATH" GOAL_FAKE_MODE=complete GOAL_SKILL_SCAN_DIRS="$skill_dir" "$BIN" start-ready "Goal: Create an X/Twitter client acquisition playbook. Definition of Done: playbook exists. Acceptance Criteria: it includes outreach templates and lead scoring. Verification Plan: inspect the playbook. Out of Scope: no auto-DM spam."
+  ) >/dev/null 2>&1
+  local code=$?
+  set -e
+
+  [[ "$code" -ne 0 ]] || fail "missing specialist skills should block even when one related skill is installed"
+  assert_eq "needs-skill-approval" "$(cat "$project/.goal/status")" "missing specialist skill status"
+  rg -q 'bensigo-upwork-proposal|headline-formulas|prompt-engineering-patterns' "$project/.goal/clarify.md" || fail "clarify file does not name missing specialist skills"
+  [[ ! -f "$project/.goal/logs/worker-1.md" ]] || fail "worker ran despite missing specialist skill candidates"
+}
+
+test_missing_specialist_skill_can_be_explicitly_approved_to_skip() {
+  local project fake_bin skill_dir
+  project="$(make_project)"
+  fake_bin="$project/fake-bin"
+  skill_dir="$project/skills"
+  mkdir -p "$skill_dir"
+  make_skill "$skill_dir" notion-research-documentation
+  make_fake_codex "$fake_bin" complete
+
+  (
+    cd "$project"
+    PATH="$fake_bin:$PATH" GOAL_FAKE_MODE=complete GOAL_SKILL_SCAN_DIRS="$skill_dir" "$BIN" start-ready "Goal: Create an X/Twitter client acquisition playbook. Definition of Done: playbook exists. Acceptance Criteria: it includes outreach templates and lead scoring. Verification Plan: inspect the playbook. Out of Scope: no auto-DM spam. Missing Skill Approval: approved."
+  ) >/dev/null
+
+  assert_eq "complete" "$(cat "$project/.goal/status")" "explicit missing skill skip approval status"
+  rg -q 'Missing Skill Approval: approved' "$project/.goal/goal.md" || fail "approval marker was not preserved"
+}
+
+test_client_acquisition_not_misclassified_by_quality_test_language() {
+  local project fake_bin skill_dir
+  project="$(make_project)"
+  fake_bin="$project/fake-bin"
+  skill_dir="$project/skills"
+  mkdir -p "$skill_dir"
+  make_skill "$skill_dir" notion-research-documentation
+  make_skill "$skill_dir" upwork-job-scoring
+  make_skill "$skill_dir" bensigo-upwork-proposal
+  make_skill "$skill_dir" headline-formulas
+  make_skill "$skill_dir" prompt-engineering-patterns
+  make_fake_codex "$fake_bin" complete
+
+  (
+    cd "$project"
+    PATH="$fake_bin:$PATH" GOAL_FAKE_MODE=complete GOAL_SKILL_SCAN_DIRS="$skill_dir" "$BIN" start-ready "Goal: Re-run the X/Twitter client acquisition playbook to test whether the skill-discovery gate improves quality. Definition of Done: rerun playbook exists. Acceptance Criteria: comparison includes outreach, lead scoring, and proposal quality. Verification Plan: inspect both outputs and compare quality. Out of Scope: no code changes."
+  ) >/dev/null
+
+  rg -q 'Task Type: client-acquisition' "$project/.goal/goal.md" || fail "client acquisition task was misclassified by quality test language"
+  rg -q 'bensigo-upwork-proposal' "$project/.goal/goal.md" || fail "client acquisition route did not include proposal skill"
+  ! rg -q 'Task Type: coding' "$project/.goal/goal.md" || fail "client acquisition route fell through to coding"
 }
 
 test_coding_task_not_misclassified_by_no_docs_scope() {
@@ -359,6 +445,9 @@ test_hook_rejects_incomplete_goal_contract
 test_start_ready_appends_installed_skill_plan
 test_hook_prompts_enforce_skill_plan
 test_missing_task_skill_stops_for_approval
+test_missing_specialist_skill_blocks_even_with_some_installed
+test_missing_specialist_skill_can_be_explicitly_approved_to_skip
+test_client_acquisition_not_misclassified_by_quality_test_language
 test_coding_task_not_misclassified_by_no_docs_scope
 test_clarify_writes_blocking_question_without_starting_worker
 test_answer_can_produce_ready_handoff_and_start_clarified

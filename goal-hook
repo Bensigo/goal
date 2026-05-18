@@ -151,10 +151,12 @@ write_skill_preflight() {
     cat > "$SKILL_PREFLIGHT_FILE" <<EOF
 Skill Plan:
 - Task Type: unspecified
+- Skill Discovery Quality Gate: required
 - Required Installed Skills:
 - none
 - Missing Skill Candidates:
 - none
+- Missing Skill Approval: required unless missing candidates are none.
 - Skill Hub Policy: Do not install skills silently.
 EOF
     return 0
@@ -186,12 +188,19 @@ skill_preflight_blocks_worker() {
     END { print count + 0 }
   ' "$SKILL_PREFLIGHT_FILE")"
 
-  if [[ "$required_count" == "0" && "$missing_count" != "0" ]]; then
+  local skip_missing_approved
+  skip_missing_approved="0"
+  if rg -qi 'Missing Skill Approval:[[:space:]]*approved[[:space:].,;]*$|Skill Discovery Approval:[[:space:]]*approved[[:space:].,;]*$|Approved Missing Skill Skip:[[:space:]]*yes[[:space:].,;]*$' "$SKILL_PREFLIGHT_FILE" "$GOAL_FILE"; then
+    skip_missing_approved="1"
+  fi
+
+  if [[ "$missing_count" != "0" && "$skip_missing_approved" != "1" ]]; then
     printf "needs-skill-approval\n" > "$STATUS_FILE"
     cat > "$STATE_DIR/clarify.md" <<EOF
 Skill approval needed before running the worker.
 
-The goal's Skill Plan did not find an installed skill for this task type.
+The goal's Skill Plan found useful missing specialist skill candidates.
+Goal blocks here so the worker does not assume it can do high-skill work generically.
 
 Missing Skill Candidates:
 $(awk '
@@ -200,7 +209,11 @@ $(awk '
   in_missing && /^- / && $0 !~ /^- none$/ { print $0 }
 ' "$SKILL_PREFLIGHT_FILE")
 
-Codex-goal will not install skills silently. Install an appropriate skill or approve a skill-hub install, then rerun the goal.
+Goal will not install skills silently. Install an appropriate skill, approve a skill-hub install/search, or explicitly approve skipping missing candidates by adding:
+
+Missing Skill Approval: approved
+
+Then rerun the goal.
 EOF
     return 0
   fi

@@ -105,12 +105,15 @@ append_skill_plan() {
 
   skill_inventory | sort -fu > "$STATE_DIR/skill-inventory.txt"
 
-  local goal_lower task_type candidates installed missing skill line skill_path
+  local goal_lower task_type candidates installed missing skill line skill_path missing_approval
   goal_lower="$(tr '[:upper:]' '[:lower:]' < "$GOAL_FILE")"
   task_type="general"
   candidates=""
 
-  if [[ "$goal_lower" =~ bug|fix|code|coding|refactor|test|implement ]]; then
+  if [[ "$goal_lower" =~ client[[:space:]-]?acquisition|lead[[:space:]-]?gen|lead[[:space:]-]?generation|sales|outreach|prospect|proposal|twitter|x/twitter|x[[:space:]-]?search|x[[:space:]-]?lead ]]; then
+    task_type="client-acquisition"
+    candidates="notion-research-documentation upwork-job-scoring bensigo-upwork-proposal headline-formulas prompt-engineering-patterns"
+  elif [[ "$goal_lower" =~ bug|fix|code|coding|refactor|test|implement ]]; then
     task_type="coding"
     candidates="test-driven-development verification-before-completion"
     if [[ "$goal_lower" =~ bug|fix|debug|failure|failing|broken|regression ]]; then
@@ -160,17 +163,23 @@ append_skill_plan() {
   if [[ -z "$missing" ]]; then
     missing="- none"$'\n'
   fi
+  missing_approval="required unless missing candidates are none. Set this field to approved only after explicit user approval to continue without them."
+  if rg -qi 'Missing Skill Approval:[[:space:]]*approved[[:space:].,;]*$|Skill Discovery Approval:[[:space:]]*approved[[:space:].,;]*$|Approved Missing Skill Skip:[[:space:]]*yes[[:space:].,;]*$' "$GOAL_FILE"; then
+    missing_approval="approved"
+  fi
 
   cat >> "$GOAL_FILE" <<EOF
 
 Skill Plan:
 - Task Type: $task_type
+- Skill Discovery Quality Gate: required
 - Required Installed Skills:
 $installed- Missing Skill Candidates:
-$missing- Skill Hub Policy: Do not install skills silently. If no installed skill covers a required task type, stop and ask the user before installing from the skill hub or GitHub.
+$missing- Missing Skill Approval: $missing_approval
+- Skill Hub Policy: Do not install skills silently. If any useful specialist skill is missing, stop and ask the user before installing from the skill hub or GitHub, or before skipping it.
 - Worker Skill Requirements: Read and apply every Required Installed Skill before implementation. If a required skill cannot be used, document the blocker in .goal/clarify.md instead of substituting generic work.
 - Reviewer Skill Checks: Fail the review if a required skill was skipped, if the worker used generic work where a specialized skill was available, or if skill-specific verification was omitted.
-- Evaluator Skill Checks: Mark DONE: yes only when the acceptance criteria pass and the Required Installed Skills were followed or a valid blocker was documented.
+- Evaluator Skill Checks: Mark DONE: yes only when the acceptance criteria pass, the Required Installed Skills were followed, and missing specialist skills were either installed or explicitly approved to skip.
 EOF
 }
 
