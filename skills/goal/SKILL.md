@@ -39,9 +39,11 @@ Before starting the CLI, run a skill discovery quality gate:
 
 - Identify task types needed for best quality, not just minimum completion.
 - Check installed skills first.
-- Identify likely missing high-value skill candidates from the skill hub or known skill sources when specialist skills could improve the result.
+- Identify likely missing high-value skill capabilities from the skill hub, marketplace, or known skill sources when specialist skills could improve the result.
+- Verify candidate skill descriptions and source before treating a public marketplace, hub, GitHub, or local skill as suitable.
 - Do not install anything silently.
-- If useful missing candidates exist, stop before `start-ready`, explain why they could improve the result, and ask the user whether to approve install/search/use or approve skipping them.
+- If useful missing candidates exist, search the public Open Agent Skill API first, use the skills.sh API only when `SKILLS_API_KEY` or `SKILLS_SH_API_KEY` is configured, then stop before `start-ready`, recommend public marketplace/skill hub/GitHub/local verified skill search targets, and ask the user whether to approve install/search/use or approve skipping them.
+- If the user does not install or approve suitable skills, report that the task cannot be done to a high-quality standard with the current skill set.
 - Continue only when installed skills cover the high-skill work, missing candidates are installed, or the user explicitly approves skipping them.
 
 The CLI appends a `Skill Plan` automatically when it starts, but the chat handoff must include the quality-gate result so the worker does not assume generic competence where a specialist skill may exist.
@@ -82,10 +84,10 @@ The hybrid flow:
 Skill routing rules:
 
 - Check local installed skills before execution.
-- Search/identify useful missing skill candidates before execution for high-skill work. This is a quality gate, not an optional optimization.
+- Search/identify useful missing skill capabilities before execution for high-skill work. Match skills by description and verifiable source, not name alone. This is a quality gate, not an optional optimization.
 - Require matching installed skills for high-skill task types such as images, articles, slides, research, plans, prototypes, marketing/client acquisition, sales/outreach, and coding/debugging.
 - Never install from the skill hub, GitHub, or `npx skills` silently.
-- If a useful specialist skill may improve quality and is not installed, write the missing candidates to `.goal/clarify.md`, set status to `needs-skill-approval`, and wait for explicit user approval, approved skip, or manual installation.
+- If a useful specialist skill capability may improve quality and is not installed, write the missing capability labels and search/install recommendations to `.goal/clarify.md`, set status to `needs-skill-approval`, and wait for explicit user approval, approved skip, or manual installation.
 - Do not treat “I can do this myself” as sufficient for high-skill work when a specialist skill might exist.
 - Worker, reviewer, and evaluator prompts must treat the `Skill Plan` as part of the contract.
 

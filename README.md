@@ -109,7 +109,7 @@ Skill Plan:
 
 The CLI can append a `Skill Plan` automatically. The worker, reviewer, and evaluator treat it as part of the contract.
 
-For high-skill work, the Skill Plan is a discovery gate, not just routing metadata. If useful specialist skills are missing, `goal` stops with `needs-skill-approval` until you install/search/approve those skills or explicitly approve continuing without them.
+For high-skill work, the Skill Plan is a discovery gate, not just routing metadata. If useful specialist skills are missing, `goal` stops with `needs-skill-approval`, recommends what to search/install from public marketplace, skill hub, GitHub, or local verified sources, and waits for user approval before install/use. If the user does not install or approve suitable skills, the task is blocked because it cannot be done to a high-quality standard with the current skill set.
 
 `start-ready`, `start-clarified`, and the hook all block autonomous execution unless the handoff includes objective success criteria and a verification plan. At minimum, the goal contract must include `Goal`, `Definition of Done`, `Acceptance Criteria`, `Verification Plan`, and `Out of Scope`.
 
@@ -131,9 +131,9 @@ It routes common task types to relevant skills:
 - planning -> planning/issue/milestone skills
 - frontend prototypes -> frontend/browser verification skills
 - coding -> TDD and verification skills
-- client acquisition, sales, outreach, or X/Twitter lead research -> research, proposal, scoring, headline, and prompt-engineering skills
+- client acquisition, sales, outreach, or X/Twitter lead research -> research/documentation, lead scoring, proposal/outreach, headline/copywriting, and prompt-engineering capabilities
 
-If a useful specialist skill candidate is missing, the loop stops with `needs-skill-approval` even when some relevant skills are installed. This prevents the worker from assuming generic competence where a better specialist skill may exist. It does not install from a skill hub, GitHub, or `npx skills` without explicit user approval.
+If a useful specialist skill capability is missing, the loop stops with `needs-skill-approval` even when some relevant skills are installed. This prevents the worker from assuming generic competence where a better specialist skill may exist. Missing candidates are capability labels, not local user-specific skill names; install/search for an appropriate marketplace, hub, GitHub, or local skill that satisfies the capability. Candidate skills must be judged by description and source, not name alone. `goal` recommends skill search/install targets, but does not install from a skill hub, GitHub, or `npx skills` without explicit user approval.
 
 To continue without missing candidates, explicitly add this to the goal contract:
 
@@ -155,11 +155,16 @@ Useful environment overrides:
 GOAL_STALL_TIMEOUT_SECONDS=180 goal run
 GOAL_STALLED_WORKER_RETRIES=1 goal run
 GOAL_SKILL_SCAN_DIRS="/path/to/skills:/another/path" goal start-ready "..."
+OPEN_AGENT_SKILL_BASE_URL="https://openagentskill.com" goal start-ready "..."
+SKILLS_API_KEY="sk_live_..." goal start-ready "..."
+GOAL_SKILL_SEARCH_COMMAND='your-search-command "$GOAL_SKILL_CAPABILITY"' goal start-ready "..."
 GOAL_AGENT=claude goal run
 GOAL_AGENT_COMMAND='my-agent --project "$GOAL_PROJECT" --output "$GOAL_OUTPUT" "$GOAL_PROMPT"' goal run
 ```
 
 By default `goal` runs `codex exec`. Set `GOAL_AGENT=claude` to run `claude -p`, or set `GOAL_AGENT_COMMAND` for another executor. Custom commands receive `GOAL_PROJECT`, `GOAL_OUTPUT`, and `GOAL_PROMPT`.
+
+By default, `goal` searches the public Open Agent Skill read API first; it does not require an API key. Set `SKILLS_API_KEY` or `SKILLS_SH_API_KEY` to also allow the skills.sh API as a fallback. `goal` checks descriptions/details before recommending a skill and still waits for user approval before install/use. `GOAL_SKILL_SEARCH_COMMAND` remains a final fallback for another search provider; it receives `GOAL_SKILL_CAPABILITY` and should print one short recommendation.
 
 Older `CODEX_GOAL_*` environment variables and the `codex-goal` command remain supported as compatibility aliases.
 

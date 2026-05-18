@@ -156,8 +156,10 @@ Skill Plan:
 - none
 - Missing Skill Candidates:
 - none
-- Missing Skill Approval: required unless missing candidates are none.
-- Skill Hub Policy: Do not install skills silently.
+- Missing Skill Approval: not required; no missing candidates.
+- Skill Search Recommendations:
+- none
+- Skill Hub Policy: Do not install skills silently. Search the public marketplace, skill hub, GitHub, or local verified sources for missing capabilities, then recommend matching skills for user approval before install/use. Verify candidate skill descriptions and source before treating them as suitable. If the user does not install/approve suitable skills, report that the task cannot be done to a high-quality standard with the current skill set.
 EOF
     return 0
   fi
@@ -212,6 +214,15 @@ $(awk '
 Goal will not install skills silently. Install an appropriate skill, approve a skill-hub install/search, or explicitly approve skipping missing candidates by adding:
 
 Missing Skill Approval: approved
+
+Recommended skill search/install targets:
+$(awk '
+  /^- Skill Search Recommendations:/ { in_recommendations=1; next }
+  /^- [A-Z][A-Za-z ]+:/ { in_recommendations=0 }
+  in_recommendations && /^- / && $0 !~ /^- none$/ { print $0 }
+' "$SKILL_PREFLIGHT_FILE")
+
+Without installing or approving suitable skills, this task cannot be done to a high-quality standard with the current skill set.
 
 Then rerun the goal.
 EOF
