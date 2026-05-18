@@ -1,0 +1,516 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_ROOT="$(pwd)"
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE" ]]; do
+  SOURCE_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE_TARGET="$(readlink "$SOURCE")"
+  if [[ "$SOURCE_TARGET" == /* ]]; then
+    SOURCE="$SOURCE_TARGET"
+  else
+    SOURCE="$SOURCE_DIR/$SOURCE_TARGET"
+  fi
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+RUNTIME_ROOT="${GOAL_HOME:-${CODEX_GOAL_HOME:-$(cd "$SCRIPT_DIR/.." && pwd)}}"
+CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+AGENTS_HOME="${AGENTS_HOME:-$HOME/.agents}"
+STATE_DIR="${GOAL_STATE_DIR:-${CODEX_GOAL_STATE_DIR:-$PROJECT_ROOT/.goal}}"
+LOG_DIR="$STATE_DIR/logs"
+STATUS_FILE="$STATE_DIR/status"
+GOAL_FILE="$STATE_DIR/goal.md"
+CLARIFY_FILE="$STATE_DIR/clarify.md"
+CLARIFY_ANSWERS_FILE="$STATE_DIR/clarify-answers.md"
+READY_HANDOFF_FILE="$STATE_DIR/ready-handoff.md"
+MAX_ITERATIONS_FILE="$STATE_DIR/max-iterations"
+
+mkdir -p "$LOG_DIR"
+
+run_agent() {
+  local output_file="$1"
+  local prompt="$2"
+
+  mkdir -p "$(dirname "$output_file")"
+
+  local agent_command="${GOAL_AGENT_COMMAND:-${CODEX_GOAL_AGENT_COMMAND:-}}"
+  local agent="${GOAL_AGENT:-${CODEX_GOAL_AGENT:-codex}}"
+
+  if [[ -n "$agent_command" ]]; then
+    GOAL_PROJECT="$PROJECT_ROOT" \
+      GOAL_OUTPUT="$output_file" \
+      GOAL_PROMPT="$prompt" \
+      CODEX_GOAL_PROJECT="$PROJECT_ROOT" \
+      CODEX_GOAL_OUTPUT="$output_file" \
+      CODEX_GOAL_PROMPT="$prompt" \
+      sh -c "$agent_command"
+    return
+  fi
+
+  case "$agent" in
+    codex)
+      GOAL_INTERNAL=1 CODEX_GOAL_INTERNAL=1 codex exec \
+        -C "$PROJECT_ROOT" \
+        -s danger-full-access \
+        --skip-git-repo-check \
+        -o "$output_file" \
+        "$prompt"
+      ;;
+    claude)
+      (
+        cd "$PROJECT_ROOT"
+        claude -p "$prompt" > "$output_file"
+      )
+      ;;
+    *)
+      printf "Unsupported GOAL_AGENT: %s\n" "$agent" >&2
+      printf "Use GOAL_AGENT=codex, GOAL_AGENT=claude, or GOAL_AGENT_COMMAND.\n" >&2
+      return 2
+      ;;
+  esac
+}
+
+skill_inventory() {
+  local scan_dirs
+  scan_dirs="${GOAL_SKILL_SCAN_DIRS:-${CODEX_GOAL_SKILL_SCAN_DIRS:-$CODEX_HOME/skills:$AGENTS_HOME/skills:$CODEX_HOME/plugins/cache:$CODEX_HOME/vendor_imports}}"
+  IFS=':' read -r -a dirs <<< "$scan_dirs"
+  find "${dirs[@]}" -name SKILL.md -type f 2>/dev/null |
+    while IFS= read -r skill_file; do
+      local dir metadata_name
+      dir="$(basename "$(dirname "$skill_file")")"
+      metadata_name="$(sed -n 's/^name:[[:space:]]*//p' "$skill_file" | head -1)"
+      printf "%s|%s\n" "$dir" "$skill_file"
+      if [[ -n "$metadata_name" && "$metadata_name" != "$dir" ]]; then
+        printf "%s|%s\n" "$metadata_name" "$skill_file"
+      fi
+    done
+}
+
+skill_exists() {
+  local needle="$1"
+  rg -i -q "^${needle//\//\\/}\\|" "$STATE_DIR/skill-inventory.txt"
+}
+
+append_skill_if_installed() {
+  local skill="$1"
+  if skill_exists "$skill"; then
+    rg -i "^${skill//\//\\/}\\|" "$STATE_DIR/skill-inventory.txt" | head -1
+  fi
+}
+
+append_skill_plan() {
+  if rg -q '^Skill Plan:' "$GOAL_FILE"; then
+    return
+  fi
+
+  skill_inventory | sort -fu > "$STATE_DIR/skill-inventory.txt"
+
+  local goal_lower task_type candidates installed missing skill line skill_path
+  goal_lower="$(tr '[:upper:]' '[:lower:]' < "$GOAL_FILE")"
+  task_type="general"
+  candidates=""
+
+  if [[ "$goal_lower" =~ bug|fix|code|coding|refactor|test|implement ]]; then
+    task_type="coding"
+    candidates="test-driven-development verification-before-completion"
+    if [[ "$goal_lower" =~ bug|fix|debug|failure|failing|broken|regression ]]; then
+      candidates="$candidates systematic-debugging diagnose"
+    fi
+    if [[ "$goal_lower" =~ review|merge|pr|pull[[:space:]-]?request ]]; then
+      candidates="$candidates review requesting-code-review"
+    fi
+  elif [[ "$goal_lower" =~ image|photo|illustration|asset|logo|icon|picture ]]; then
+    task_type="image-generation"
+    candidates="imagegen"
+  elif [[ "$goal_lower" =~ slide|deck|presentation|ppt|pptx ]]; then
+    task_type="presentation"
+    candidates="presentations Presentations"
+  elif [[ "$goal_lower" =~ spreadsheet|sheet|xlsx|csv|workbook ]]; then
+    task_type="spreadsheet"
+    candidates="spreadsheets Spreadsheets"
+  elif [[ "$goal_lower" =~ article|blog|essay|newsletter|copy|write|editing ]]; then
+    task_type="writing"
+    candidates="edit-article writing-shape writing-beats writing-fragments headline-formulas prompt-engineering-patterns"
+  elif [[ "$goal_lower" =~ research|sources|citation|notion|documentation ]]; then
+    task_type="research-documentation"
+    candidates="notion-research-documentation openai-docs grill-with-docs"
+  elif [[ "$goal_lower" =~ landing|website|web[[:space:]-]?app|prototype|frontend|react|dashboard|site|ui ]]; then
+    task_type="frontend-prototype"
+    candidates="frontend-app-builder frontend-testing-debugging frontend-skill playwright verification-before-completion"
+  elif [[ "$goal_lower" =~ plan|prd|milestone|issue|roadmap|spec ]]; then
+    task_type="planning"
+    candidates="writing-plans to-issues to-milestones grill-me"
+  fi
+
+  installed=""
+  missing=""
+  for skill in $candidates; do
+    line="$(append_skill_if_installed "$skill" || true)"
+    if [[ -n "$line" ]]; then
+      skill_path="${line#*|}"
+      installed="${installed}- ${line%%|*} (${skill_path})"$'\n'
+    else
+      missing="${missing}- ${skill}"$'\n'
+    fi
+  done
+
+  if [[ -z "$installed" ]]; then
+    installed="- none"$'\n'
+  fi
+  if [[ -z "$missing" ]]; then
+    missing="- none"$'\n'
+  fi
+
+  cat >> "$GOAL_FILE" <<EOF
+
+Skill Plan:
+- Task Type: $task_type
+- Required Installed Skills:
+$installed- Missing Skill Candidates:
+$missing- Skill Hub Policy: Do not install skills silently. If no installed skill covers a required task type, stop and ask the user before installing from the skill hub or GitHub.
+- Worker Skill Requirements: Read and apply every Required Installed Skill before implementation. If a required skill cannot be used, document the blocker in .goal/clarify.md instead of substituting generic work.
+- Reviewer Skill Checks: Fail the review if a required skill was skipped, if the worker used generic work where a specialized skill was available, or if skill-specific verification was omitted.
+- Evaluator Skill Checks: Mark DONE: yes only when the acceptance criteria pass and the Required Installed Skills were followed or a valid blocker was documented.
+EOF
+}
+
+has_handoff_section() {
+  local section="$1"
+  rg -i -q "(^|[[:space:]#])${section}[[:space:]]*:" "$GOAL_FILE"
+}
+
+validate_ready_handoff() {
+  local missing=""
+
+  for section in "Goal" "Definition of Done" "Acceptance Criteria" "Verification Plan" "Out of Scope"; do
+    if ! has_handoff_section "$section"; then
+      missing="${missing}- ${section}"$'\n'
+    fi
+  done
+
+  if [[ -z "$missing" ]]; then
+    return 0
+  fi
+
+  printf "needs-clarification\n" > "$STATUS_FILE"
+  cat > "$CLARIFY_FILE" <<EOF
+The handoff is not ready for autonomous execution.
+
+Missing required sections:
+$missing
+Autonomous execution requires objective success criteria and a concrete verification plan.
+
+Use:
+  goal clarify "<raw task>"
+  goal answer "<answer to the blocking question>"
+  goal start-clarified
+
+Or rerun start-ready with a complete handoff.
+EOF
+  return 1
+}
+
+usage() {
+  cat <<EOF
+Usage:
+  goal "task to complete"
+  goal start "task to complete"
+  goal clarify "task to clarify"
+  goal answer "answer to the current blocking question"
+  goal start-clarified
+  goal start-ready "clarified task with acceptance criteria"
+  goal --ready "clarified task with acceptance criteria"
+  goal run
+  goal status
+  goal stop
+  goal install-hook
+
+What it does:
+  1. Uses the grill-with-docs skill to clarify unclear tasks before execution.
+  2. Runs a fresh worker instance for the goal.
+  3. Runs a fresh reviewer instance.
+  4. Repeats until done or max iterations is reached.
+EOF
+}
+
+run_clarifier() {
+  local check_out="$LOG_DIR/clarify-check.md"
+  local grill_skill_path="$CODEX_HOME/skills/grill-with-docs/SKILL.md"
+  [[ -f "$grill_skill_path" ]] || grill_skill_path="$RUNTIME_ROOT/skills/grill-with-docs/SKILL.md"
+
+  run_agent "$check_out" "$(cat <<PROMPT
+You are Dave, a pragmatic goal-loop clarifier.
+
+Raw goal:
+$(cat "$GOAL_FILE")
+
+Clarification answers so far:
+$(cat "$CLARIFY_ANSWERS_FILE" 2>/dev/null || true)
+
+Use the grill-with-docs skill if it is installed:
+$grill_skill_path
+
+Inspect existing project docs/code before asking. Decide whether this goal is ready for an autonomous worker.
+
+If it is not ready, return:
+READY: no
+
+Status: needs-clarification
+
+Blocking Question:
+<one highest-leverage question only>
+
+Recommended Default:
+<your recommended answer>
+
+Why This Matters:
+<why this blocks objective evaluation>
+
+If it is ready, return:
+READY: yes
+
+Goal:
+<one concrete sentence>
+
+Context:
+<only facts the worker needs>
+
+Definition of Done:
+<observable outcome>
+
+Acceptance Criteria:
+<specific pass/fail checks>
+
+Verification Plan:
+<exact commands, tests, screenshots, or manual checks>
+
+Out of Scope:
+<what must not change>
+
+Do not include a Skill Plan. The CLI appends it automatically.
+PROMPT
+)"
+
+  cp "$check_out" "$CLARIFY_FILE"
+
+  if rg -q '^READY:[[:space:]]*yes' "$check_out"; then
+    cp "$check_out" "$READY_HANDOFF_FILE"
+    printf "clarified\n" > "$STATUS_FILE"
+    printf "Goal is clarified. Run goal start-clarified to execute it.\n"
+    return 0
+  fi
+
+  rm -f "$READY_HANDOFF_FILE"
+  printf "needs-clarification\n" > "$STATUS_FILE"
+  printf "Clarification needed. Answer the blocking question in %s with goal answer \"...\".\n" "$CLARIFY_FILE"
+  return 1
+}
+
+clarify_goal() {
+  local task="$*"
+  if [[ -z "${task// }" ]]; then
+    usage
+    exit 2
+  fi
+
+  printf "%s\n" "$task" > "$GOAL_FILE"
+  rm -f "$CLARIFY_ANSWERS_FILE" "$READY_HANDOFF_FILE" "$STATE_DIR/iteration"
+  printf "checking\n" > "$STATUS_FILE"
+  run_clarifier
+}
+
+answer_clarification() {
+  local answer="$*"
+  if [[ -z "${answer// }" ]]; then
+    usage
+    exit 2
+  fi
+  if [[ ! -f "$GOAL_FILE" ]]; then
+    printf "No goal is being clarified. Run goal clarify \"<task>\" first.\n" >&2
+    exit 2
+  fi
+
+  {
+    printf "\nAnswer:\n"
+    printf "%s\n" "$answer"
+  } >> "$CLARIFY_ANSWERS_FILE"
+
+  printf "checking\n" > "$STATUS_FILE"
+  run_clarifier
+}
+
+start_clarified() {
+  if [[ ! -f "$READY_HANDOFF_FILE" ]]; then
+    printf "needs-clarification\n" > "$STATUS_FILE"
+    cat > "$CLARIFY_FILE" <<EOF
+No clarified handoff is ready.
+
+Run:
+  goal clarify "<raw task>"
+  goal answer "<answer to the blocking question>"
+
+Then run:
+  goal start-clarified
+EOF
+    printf "No clarified handoff is ready. See %s.\n" "$CLARIFY_FILE" >&2
+    exit 1
+  fi
+
+  start_goal --ready "$(cat "$READY_HANDOFF_FILE")"
+}
+
+status() {
+  if [[ -f "$STATUS_FILE" ]]; then
+    printf "status: %s\n" "$(cat "$STATUS_FILE")"
+  else
+    printf "status: none\n"
+  fi
+
+  if [[ -f "$GOAL_FILE" ]]; then
+    printf "\ngoal:\n"
+    sed -n '1,120p' "$GOAL_FILE"
+  fi
+
+  if [[ -f "$CLARIFY_FILE" ]]; then
+    printf "\nclarification needed:\n"
+    sed -n '1,160p' "$CLARIFY_FILE"
+  fi
+
+  if [[ -f "$READY_HANDOFF_FILE" ]]; then
+    printf "\nready handoff:\n"
+    sed -n '1,160p' "$READY_HANDOFF_FILE"
+  fi
+}
+
+start_goal() {
+  local skip_clarity="${1:-}"
+  if [[ "$skip_clarity" == "--ready" ]]; then
+    shift
+  else
+    skip_clarity=""
+  fi
+
+  local task="$*"
+  if [[ -z "${task// }" ]]; then
+    usage
+    exit 2
+  fi
+
+  printf "%s\n" "$task" > "$GOAL_FILE"
+  rm -f "$CLARIFY_FILE"
+  rm -f "$STATE_DIR/iteration"
+  printf "10\n" > "$MAX_ITERATIONS_FILE"
+
+  if [[ "$skip_clarity" == "--ready" ]]; then
+    validate_ready_handoff || exit 1
+    append_skill_plan
+    printf "active\n" > "$STATUS_FILE"
+    "$RUNTIME_ROOT/goal-hook" --project "$PROJECT_ROOT" --loop
+    return
+  fi
+
+  printf "checking\n" > "$STATUS_FILE"
+
+  local check_out="$LOG_DIR/clarity-check.md"
+  local grill_skill_path="$CODEX_HOME/skills/grill-with-docs/SKILL.md"
+  [[ -f "$grill_skill_path" ]] || grill_skill_path="$RUNTIME_ROOT/skills/grill-with-docs/SKILL.md"
+
+  run_agent "$check_out" "$(cat <<PROMPT
+You are Dave, a pragmatic goal-loop gatekeeper.
+
+Task from the user:
+$(cat "$GOAL_FILE")
+
+Decide whether this task is clear enough for an autonomous worker to execute safely in this repository.
+
+You must use the grill-with-docs skill, located at:
+$grill_skill_path
+
+If that skill is missing, stop and tell the user to run:
+goal install-hook
+
+Apply that skill to the task:
+- Inspect existing project docs first: CONTEXT-MAP.md, CONTEXT.md, docs/adr/, README files, and relevant source code.
+- Challenge vague language against the repository existing domain terms.
+- If the task is vague, incomplete, risky, or has no definition of done, do not execute.
+- Because this is a non-interactive hook/CLI pass, ask only the single highest-leverage next question and include your recommended default answer.
+- Define the acceptance criteria that would make the task done.
+- Only update CONTEXT.md or ADRs if you learned a durable domain decision from existing docs/code. Do not create documentation just to store questions.
+
+Return one of these exact markers:
+READY: yes
+or
+READY: no
+
+If READY: no, include the questions the user must answer.
+If READY: yes, include a complete execution handoff with these sections:
+- Goal
+- Context
+- Definition of Done
+- Acceptance Criteria
+- Verification Plan
+- Out of Scope
+
+Do not include a Skill Plan. The CLI appends it automatically.
+PROMPT
+)"
+
+  if rg -q '^READY:[[:space:]]*no' "$check_out"; then
+    cp "$check_out" "$CLARIFY_FILE"
+    printf "needs-clarification\n" > "$STATUS_FILE"
+    printf "Task is not clear enough. Answer the questions in %s, then rerun goal with the refined task.\n" "$CLARIFY_FILE"
+    exit 1
+  fi
+
+  cp "$check_out" "$GOAL_FILE"
+  validate_ready_handoff || exit 1
+  append_skill_plan
+  printf "active\n" > "$STATUS_FILE"
+  "$RUNTIME_ROOT/goal-hook" --project "$PROJECT_ROOT" --loop
+}
+
+case "${1:-}" in
+  ""|-h|--help|help)
+    usage
+    ;;
+  start)
+    shift
+    start_goal "$@"
+    ;;
+  clarify)
+    shift
+    clarify_goal "$@"
+    ;;
+  answer)
+    shift
+    answer_clarification "$@"
+    ;;
+  start-clarified)
+    shift
+    start_clarified "$@"
+    ;;
+  start-ready)
+    shift
+    start_goal --ready "$@"
+    ;;
+  --ready)
+    shift
+    start_goal --ready "$@"
+    ;;
+  run)
+    "$RUNTIME_ROOT/goal-hook" --project "$PROJECT_ROOT" --loop
+    ;;
+  status)
+    status
+    ;;
+  stop)
+    printf "stopped\n" > "$STATUS_FILE"
+    printf "Goal loop stopped.\n"
+    ;;
+  install-hook)
+    "$RUNTIME_ROOT/install-goal-hook.mjs" global
+    ;;
+  *)
+    start_goal "$@"
+    ;;
+esac

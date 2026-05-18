@@ -1,0 +1,440 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_ROOT=""
+LOOP_ONCE=1
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --project)
+      PROJECT_ROOT="$2"
+      shift 2
+      ;;
+    --loop)
+      LOOP_ONCE=0
+      shift
+      ;;
+    --from-hook)
+      shift
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+
+if [[ -z "$PROJECT_ROOT" ]]; then
+  PROJECT_ROOT="$(pwd)"
+fi
+
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE" ]]; do
+  SOURCE_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE_TARGET="$(readlink "$SOURCE")"
+  if [[ "$SOURCE_TARGET" == /* ]]; then
+    SOURCE="$SOURCE_TARGET"
+  else
+    SOURCE="$SOURCE_DIR/$SOURCE_TARGET"
+  fi
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+RUNTIME_ROOT="${GOAL_HOME:-${CODEX_GOAL_HOME:-$SCRIPT_DIR}}"
+STATE_DIR="${GOAL_STATE_DIR:-${CODEX_GOAL_STATE_DIR:-$PROJECT_ROOT/.goal}}"
+LOG_DIR="$STATE_DIR/logs"
+STATUS_FILE="$STATE_DIR/status"
+GOAL_FILE="$STATE_DIR/goal.md"
+CLARIFY_FILE="$STATE_DIR/clarify.md"
+ITERATION_FILE="$STATE_DIR/iteration"
+MAX_ITERATIONS_FILE="$STATE_DIR/max-iterations"
+LOCK_DIR="$STATE_DIR/lock"
+STALL_TIMEOUT_SECONDS="${GOAL_STALL_TIMEOUT_SECONDS:-${CODEX_GOAL_STALL_TIMEOUT_SECONDS:-600}}"
+STALLED_WORKER_RETRIES="${GOAL_STALLED_WORKER_RETRIES:-${CODEX_GOAL_STALLED_WORKER_RETRIES:-3}}"
+SKILL_PREFLIGHT_FILE="$STATE_DIR/skill-preflight.md"
+
+mkdir -p "$LOG_DIR"
+
+run_agent() {
+  local output_file="$1"
+  local prompt="$2"
+
+  mkdir -p "$(dirname "$output_file")"
+
+  local agent_command="${GOAL_AGENT_COMMAND:-${CODEX_GOAL_AGENT_COMMAND:-}}"
+  local agent="${GOAL_AGENT:-${CODEX_GOAL_AGENT:-codex}}"
+
+  if [[ -n "$agent_command" ]]; then
+    GOAL_PROJECT="$PROJECT_ROOT" \
+      GOAL_OUTPUT="$output_file" \
+      GOAL_PROMPT="$prompt" \
+      CODEX_GOAL_PROJECT="$PROJECT_ROOT" \
+      CODEX_GOAL_OUTPUT="$output_file" \
+      CODEX_GOAL_PROMPT="$prompt" \
+      sh -c "$agent_command"
+    return
+  fi
+
+  case "$agent" in
+    codex)
+      env GOAL_INTERNAL=1 CODEX_GOAL_INTERNAL=1 codex exec \
+        -C "$PROJECT_ROOT" \
+        -s danger-full-access \
+        --dangerously-bypass-approvals-and-sandbox \
+        -o "$output_file" \
+        "$prompt"
+      ;;
+    claude)
+      (
+        cd "$PROJECT_ROOT"
+        claude -p "$prompt" > "$output_file"
+      )
+      ;;
+    *)
+      printf "Unsupported GOAL_AGENT: %s\n" "$agent" >&2
+      printf "Use GOAL_AGENT=codex, GOAL_AGENT=claude, or GOAL_AGENT_COMMAND.\n" >&2
+      return 2
+      ;;
+  esac
+}
+
+if [[ "${GOAL_INTERNAL:-}" == "1" || "${CODEX_GOAL_INTERNAL:-}" == "1" ]]; then
+  exit 0
+fi
+
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  exit 0
+fi
+trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
+
+if [[ ! -f "$STATUS_FILE" ]] || [[ "$(cat "$STATUS_FILE")" != "active" ]]; then
+  exit 0
+fi
+
+if [[ ! -f "$GOAL_FILE" ]]; then
+  printf "error\n" > "$STATUS_FILE"
+  printf "Missing goal file: %s\n" "$GOAL_FILE" >&2
+  exit 1
+fi
+
+has_goal_contract_section() {
+  local section="$1"
+  rg -i -q "(^|[[:space:]#])${section}[[:space:]]*:" "$GOAL_FILE"
+}
+
+goal_contract_blocks_worker() {
+  local missing=""
+
+  for section in "Goal" "Definition of Done" "Acceptance Criteria" "Verification Plan" "Out of Scope"; do
+    if ! has_goal_contract_section "$section"; then
+      missing="${missing}- ${section}"$'\n'
+    fi
+  done
+
+  if [[ -z "$missing" ]]; then
+    return 1
+  fi
+
+  printf "needs-clarification\n" > "$STATUS_FILE"
+  cat > "$CLARIFY_FILE" <<EOF
+Goal contract is incomplete. Autonomous execution is blocked.
+
+Missing required sections:
+$missing
+Autonomous execution requires objective success criteria and a concrete verification plan.
+
+Use goal clarify/answer/start-clarified, or rerun start-ready with a complete handoff.
+EOF
+  return 0
+}
+
+write_skill_preflight() {
+  if ! rg -q '^Skill Plan:' "$GOAL_FILE"; then
+    cat > "$SKILL_PREFLIGHT_FILE" <<EOF
+Skill Plan:
+- Task Type: unspecified
+- Required Installed Skills:
+- none
+- Missing Skill Candidates:
+- none
+- Skill Hub Policy: Do not install skills silently.
+EOF
+    return 0
+  fi
+
+  sed -n '/^Skill Plan:/,$p' "$GOAL_FILE" > "$SKILL_PREFLIGHT_FILE"
+}
+
+skill_preflight_blocks_worker() {
+  write_skill_preflight
+
+  if rg -q '^- Missing Skill Candidates:' "$SKILL_PREFLIGHT_FILE" &&
+     ! rg -q '^- Missing Skill Candidates:[[:space:]]*$' "$SKILL_PREFLIGHT_FILE"; then
+    :
+  fi
+
+  local required_count missing_count
+  required_count="$(awk '
+    /^- Required Installed Skills:/ { in_required=1; in_missing=0; next }
+    /^- Missing Skill Candidates:/ { in_required=0; in_missing=1; next }
+    /^- [A-Z][A-Za-z ]+:/ { in_required=0; in_missing=0 }
+    in_required && /^- / && $0 !~ /^- none$/ { count++ }
+    END { print count + 0 }
+  ' "$SKILL_PREFLIGHT_FILE")"
+  missing_count="$(awk '
+    /^- Missing Skill Candidates:/ { in_missing=1; next }
+    /^- [A-Z][A-Za-z ]+:/ { in_missing=0 }
+    in_missing && /^- / && $0 !~ /^- none$/ { count++ }
+    END { print count + 0 }
+  ' "$SKILL_PREFLIGHT_FILE")"
+
+  if [[ "$required_count" == "0" && "$missing_count" != "0" ]]; then
+    printf "needs-skill-approval\n" > "$STATUS_FILE"
+    cat > "$STATE_DIR/clarify.md" <<EOF
+Skill approval needed before running the worker.
+
+The goal's Skill Plan did not find an installed skill for this task type.
+
+Missing Skill Candidates:
+$(awk '
+  /^- Missing Skill Candidates:/ { in_missing=1; next }
+  /^- [A-Z][A-Za-z ]+:/ { in_missing=0 }
+  in_missing && /^- / && $0 !~ /^- none$/ { print $0 }
+' "$SKILL_PREFLIGHT_FILE")
+
+Codex-goal will not install skills silently. Install an appropriate skill or approve a skill-hub install, then rerun the goal.
+EOF
+    return 0
+  fi
+
+  return 1
+}
+
+iteration="$(cat "$ITERATION_FILE" 2>/dev/null || printf "0")"
+max_iterations="$(cat "$MAX_ITERATIONS_FILE" 2>/dev/null || printf "10")"
+
+run_with_timeout() {
+  local timeout_seconds="$1"
+  shift
+
+  local timeout_marker="$STATE_DIR/timeout.$$.$RANDOM"
+  "$@" &
+  local command_pid=$!
+
+  (
+    sleep "$timeout_seconds"
+    if kill -0 "$command_pid" 2>/dev/null; then
+      : > "$timeout_marker"
+      kill "$command_pid" 2>/dev/null || true
+      sleep 1
+      kill -9 "$command_pid" 2>/dev/null || true
+    fi
+  ) &
+  local watchdog_pid=$!
+
+  set +e
+  wait "$command_pid"
+  local command_status=$?
+  set -e
+
+  kill "$watchdog_pid" 2>/dev/null || true
+  wait "$watchdog_pid" 2>/dev/null || true
+
+  if [[ -f "$timeout_marker" ]]; then
+    rm -f "$timeout_marker"
+    return 124
+  fi
+
+  return "$command_status"
+}
+
+run_worker_with_retries() {
+  local worker_out="$1"
+  local notes="$2"
+  local attempt
+
+  for attempt in $(seq 1 "$STALLED_WORKER_RETRIES"); do
+    local attempt_out="$worker_out"
+    if [[ "$STALLED_WORKER_RETRIES" != "1" ]]; then
+      attempt_out="${worker_out%.md}-attempt-$attempt.md"
+    fi
+
+    local worker_prompt
+    worker_prompt="$(cat <<PROMPT
+You are a fresh worker instance running a Ralph-style goal loop.
+
+Goal:
+$(cat "$GOAL_FILE")
+
+$(cat "$SKILL_PREFLIGHT_FILE" 2>/dev/null || true)
+
+Previous reviewer/evaluator notes:
+$notes
+
+Rules:
+- You must read and apply every Required Installed Skill in the Skill Plan before implementation.
+- If a required skill cannot be used, write the blocker clearly to .goal/clarify.md and stop.
+- Do not search for or install skills. Skill hub search/install is handled only outside the worker with user approval.
+- Inspect the repository before changing files.
+- If the task is still unclear, write the blocker clearly to .goal/clarify.md and stop.
+- Implement the smallest correct change that satisfies the goal.
+- Treat the Goal file as the contract. It should contain Goal, Context, Definition of Done, Acceptance Criteria, Verification Plan, Out of Scope, and Skill Plan.
+- Do not finish until every Definition of Done item and Acceptance Criterion is satisfied or explicitly blocked.
+- Run relevant verification.
+- Do not claim completion without evidence.
+- Include a Skills Used section listing each required skill and what workflow or decision it affected.
+- Leave a concise summary of changed files and verification in your final response.
+PROMPT
+)"
+
+    set +e
+    run_with_timeout "$STALL_TIMEOUT_SECONDS" run_agent "$attempt_out" "$worker_prompt"
+    local worker_status=$?
+    set -e
+
+    if [[ "$worker_status" == "124" ]]; then
+      printf "Worker attempt %s stalled after %s seconds.\n" "$attempt" "$STALL_TIMEOUT_SECONDS" > "$LOG_DIR/worker-$iteration-attempt-$attempt.stalled"
+      continue
+    fi
+
+    if [[ "$worker_status" != "0" ]]; then
+      printf "blocked-worker-error\n" > "$STATUS_FILE"
+      printf "Worker attempt %s failed with exit code %s.\n" "$attempt" "$worker_status" > "$LOG_DIR/worker-$iteration.error"
+      return 1
+    fi
+
+    if [[ "$attempt_out" != "$worker_out" ]]; then
+      cp "$attempt_out" "$worker_out"
+    fi
+    return 0
+  done
+
+  printf "blocked-stalled-worker\n" > "$STATUS_FILE"
+  cat > "$STATE_DIR/clarify.md" <<EOF
+The worker stalled ${STALLED_WORKER_RETRIES} times in a row.
+
+Last timeout: ${STALL_TIMEOUT_SECONDS} seconds.
+Status: blocked-stalled-worker
+
+Fix the runtime, simplify the goal, or increase GOAL_STALL_TIMEOUT_SECONDS before retrying.
+EOF
+  return 1
+}
+
+run_iteration() {
+  if goal_contract_blocks_worker; then
+    return 1
+  fi
+
+  if skill_preflight_blocks_worker; then
+    return 1
+  fi
+
+  iteration=$((iteration + 1))
+  printf "%s\n" "$iteration" > "$ITERATION_FILE"
+
+  local worker_out="$LOG_DIR/worker-$iteration.md"
+  local review_out="$LOG_DIR/review-$iteration.md"
+  local eval_out="$LOG_DIR/eval-$iteration.md"
+  local notes=""
+
+  if [[ -f "$LOG_DIR/eval-$((iteration - 1)).md" ]]; then
+    notes="$(cat "$LOG_DIR/eval-$((iteration - 1)).md")"
+  fi
+
+  run_worker_with_retries "$worker_out" "$notes" || return 1
+
+  if [[ -f "$STATE_DIR/clarify.md" ]]; then
+    printf "needs-clarification\n" > "$STATUS_FILE"
+    return 1
+  fi
+
+  run_agent "$review_out" "$(cat <<PROMPT
+You are a fresh reviewer instance.
+
+Review the current repository state against this goal:
+$(cat "$GOAL_FILE")
+
+$(cat "$SKILL_PREFLIGHT_FILE" 2>/dev/null || true)
+
+Focus on:
+- correctness bugs
+- missing acceptance criteria
+- unsatisfied Definition of Done items
+- missing or weak verification
+- unsafe or unrelated changes
+- skipped required skill usage
+- generic substitutions where a required skill was available
+
+Inspect git status, diffs, and untracked files. Do not modify files unless you need to add a review artifact under .goal/logs.
+
+Return:
+REVIEW: pass
+or
+REVIEW: fail
+
+Also include:
+Skill Routing Review: pass
+or
+Skill Routing Review: fail
+
+Fail the review if a required skill was skipped, if the worker substituted a different skill, searched the skill hub, installed anything, or claimed skill use without evidence.
+If fail, list concrete fixes needed.
+PROMPT
+)"
+
+  run_agent "$eval_out" "$(cat <<PROMPT
+You are the goal-loop evaluator.
+
+Goal:
+$(cat "$GOAL_FILE")
+
+Worker result:
+$(cat "$worker_out")
+
+Reviewer result:
+$(cat "$review_out")
+
+$(cat "$SKILL_PREFLIGHT_FILE" 2>/dev/null || true)
+
+Inspect the repository if needed. Decide if the goal is truly complete.
+Use the Goal file as the contract. Mark done only if every Definition of Done item and Acceptance Criterion is satisfied, the Verification Plan was run or a concrete blocker is documented, and the Skill Plan was followed.
+DONE: yes is forbidden if required skills were skipped, if the reviewer says Skill Routing Review: fail, or if the worker installed/searched skills without explicit approval.
+
+Return one exact marker:
+DONE: yes
+or
+DONE: no
+
+If DONE: no, list the next concrete fixes for the next worker iteration.
+PROMPT
+)"
+
+  if rg -q '^DONE:[[:space:]]*yes' "$eval_out"; then
+    printf "complete\n" > "$STATUS_FILE"
+    return 0
+  fi
+
+  return 2
+}
+
+while [[ "$iteration" -lt "$max_iterations" ]]; do
+  set +e
+  run_iteration
+  result=$?
+  set -e
+
+  case "$result" in
+    0)
+      exit 0
+      ;;
+    1)
+      exit 1
+      ;;
+  esac
+
+  if [[ "$LOOP_ONCE" == "1" ]]; then
+    exit 0
+  fi
+done
+
+printf "max-iterations-reached\n" > "$STATUS_FILE"
+exit 1
